@@ -1,0 +1,139 @@
+# make_noninvasive_dataset.py  (robust + removal report)
+import re, json
+import pandas as pd
+
+IN_PATH  = "diabetes_dataset.csv"     # ← set your path
+OUT_PATH = "diabetes_noninvasive.csv" # ← output
+CAP = 40                              # max non-invasive features to keep
+
+df = pd.read_csv(IN_PATH)
+
+# ---------- 1) Find a binary target ----------
+TARGET_CANDIDATES = ["diagnosed_diabetes","diabetes","diabetes_binary","dm_label","Outcome","label"]
+target_col = next((c for c in TARGET_CANDIDATES if c in df.columns), None)
+
+if target_col is None:
+    # fallback: any column with "diab" that is 0/1
+    for c in df.columns:
+        if "diab" in c.lower():
+            vals = pd.to_numeric(df[c], errors="coerce").dropna().unique()
+            if len(vals) and set(vals).issubset({0,1,0.0,1.0}):
+                target_col = c
+                break
+if target_col is None:
+    raise ValueError("No binary diabetes label found (tried common names and 'diab*').")
+
+# normalize label to 0/1 ints
+y = df[target_col]
+if y.dtype == object:
+    y = (y.astype(str).str.strip().str.lower()
+           .map({"yes":1,"true":1,"y":1,"positive":1,"1":1,
+                 "no":0,"false":0,"n":0,"negative":0,"0":0})
+           .fillna(df[target_col]))
+y = pd.to_numeric(y, errors="coerce")
+df = df.loc[y.notna()].copy()
+df[target_col] = y.astype(int)
+
+# ---------- 2) Define leak patterns (labs/diagnosis/risk) ----------
+LEAK_PATTERNS = [
+    r"hba1c",                # HbA1c / A1c
+    r"\ba1c\b",              # exact A1c token if present alone
+    r"glucose",              # any glucose column (fasting/random/2h/etc.)
+    r"ogtt",                 # oral glucose tolerance test
+    r"2.?hour",              # 2-hour glucose
+    r"random[_-]?glucose",   # random glucose
+    r"\bfpg\b|fasting",      # fasting / FPG
+    r"insulin",
+    r"c[_-]?peptide",
+    r"diagnos",              # diagnosis/diagnosed/diagnostic
+    r"risk[_-]?score"        # precomputed risk scores
+]
+
+def leak_reason(col: str):
+    name = col.lower()
+    for p in LEAK_PATTERNS:
+        if re.search(p, name, flags=re.I):
+            return p
+    return None
+
+# ---------- 3) Preferred non-invasive features ----------
+PREFERRED = [
+    "age","sex","gender","bmi","systolic_bp","diastolic_bp",
+    "waist_to_height_ratio","waist_hip_ratio",
+    "family_history_diabetes","physical_activity_level","smoking_status",
+    "alcohol_intake","sleep_hours","hypertension_history",
+    "income_bracket","education_level","race_ethnicity","marital_status",
+    "medication_use"
+]
+
+# Build lists
+all_feat = [c for c in df.columns if c != target_col]
+leaky_map = {c: leak_reason(c) for c in all_feat}
+leak_cols = [c for c, why in leaky_map.items() if why is not None]
+
+allowed_pref = [c for c in PREFERRED if c in df.columns and c not in leak_cols]
+extras = [c for c in all_feat if c not in allowed_pref and c not in leak_cols]
+
+# Keep preferred first, then extras, up to CAP
+ordered = list(dict.fromkeys(allowed_pref + extras))
+keep = ordered[:CAP]
+
+# ---------- 4) Compute removed with reasons ----------
+removed = [c for c in all_feat if c not in keep]
+
+rows = []
+for c in removed:
+    if c in leak_cols:
+        reason = f"leak:{leaky_map[c]}"
+    elif (c in ordered) and (ordered.index(c) >= CAP):
+        reason = "cap_limit"
+    else:
+        reason = "not_selected"
+    rows.append({
+        "feature": c,
+        "reason": reason,
+        "dtype": str(df[c].dtype),
+        "n_unique": int(df[c].nunique(dropna=True)),
+        "missing_rate": float(df[c].isna().mean())
+    })
+
+removed_df = pd.DataFrame(rows).sort_values(["reason","feature"])
+kept_df = pd.DataFrame({"feature": keep, "position": range(1, len(keep)+1)})
+
+# ---------- 5) Write outputs ----------
+noninvasive = df[keep + [target_col]].copy()
+noninvasive.to_csv(OUT_PATH, index=False)
+kept_df.to_csv("kept_features.csv", index=False)
+removed_df.to_csv("removed_features.csv", index=False)
+
+# per-pattern leak counts (debug)
+leak_counts = {}
+for pat in LEAK_PATTERNS:
+    leak_counts[pat] = sum(1 for c in all_feat if re.search(pat, c.lower() , flags=re.I))
+
+with open("feature_policy.json","w") as f:
+    json.dump({
+        "target": target_col,
+        "cap": CAP,
+        "allowed_features": keep,
+        "removed_summary": {
+            "total_before": len(all_feat),
+            "kept": len(keep),
+            "removed_total": len(removed),
+            "removed_leak": int((removed_df["reason"].str.startswith("leak:")).sum()),
+            "removed_cap_limit": int((removed_df["reason"]=="cap_limit").sum()),
+            "removed_not_selected": int((removed_df["reason"]=="not_selected").sum()),
+            "leak_counts_by_pattern": leak_counts
+        },
+        "excluded_regex": LEAK_PATTERNS
+    }, f, indent=2)
+
+# ---------- 6) Console summary ----------
+print(f"Saved non-invasive dataset → {OUT_PATH}")
+print(f"Target = {target_col}")
+print(f"Kept ({len(keep)}/{len(all_feat)}): {keep}")
+print("\nRemoved features by reason:")
+print(removed_df.groupby("reason").size().rename("count"))
+if (removed_df["reason"].str.startswith("leak:")).any():
+    print("\nExamples of removed leaky columns:")
+    print(removed_df[removed_df["reason"].str.startswith("leak:")].head(10))
