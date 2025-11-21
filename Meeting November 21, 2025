@@ -1,0 +1,17 @@
+Next steps in the project
+In the dataset there is column 
+
+Preprocessing steps
+Filter out the invasive features (Cholesterol total, hdl_cholesterol, ldl_cholesterol, triglycerides, glucose_fasting, glucose_postprandial, insulin_level, hba1c)
+Filter out non relevant columns (diabetes_risk_score, diabetes_stage)
+Folter out Nan 
+Filter out redundant features (correlation matrix)
+Encode categorical variables 
+
+
+Random Forest
+AdaBoost 
+Decision Tree
+SVC
+KNN classifier
+Logistic Regression 
